@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\TicketShine.Support.Core\TicketShine.Support.Core.csproj" />
+    <ProjectReference Include="..\TicketShine.Support.Infrastructure\TicketShine.Support.Infrastructure.csproj" />
+    <!-- Build the MCP server with the web app; the web app runs it as a child process over stdio. -->
+    <ProjectReference Include="..\TicketShine.Support.McpServer\TicketShine.Support.McpServer.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\TicketShine.Support.Gmail\TicketShine.Support.Gmail.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
+  </PropertyGroup>
+
+</Project>

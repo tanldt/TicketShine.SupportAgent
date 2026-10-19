@@ -1,0 +1,722 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject SupportWorkflow Workflow
+@inject ICaseRepository Repository
+@inject CaseChangeNotifier Notifier
+@inject IDemoClock DemoClock
+@inject MailOptions Mail
+@inject EmailIngestOptions IngestOptions
+@inject IMailStore MailStore
+@inject SimulatedInboundMailSource SimulatedInbox
+@inject IReplySender Sender
+
+<PageTitle>Support Agent Demo</PageTitle>
+
+<header class="topbar">
+    <div class="brand">
+        <span class="logo" aria-hidden="true">TS</span>
+        <div>
+            <h1>Support agent workspace</h1>
+            <p>Ticket Shine · local demo · fictional data · simulated send only</p>
+        </div>
+    </div>
+    <div class="topbar-meta">
+        <span class="badge @(Workflow.Generator.Source == DraftSource.LiveAi ? "badge-live" : "badge-template")" title="Draft generator">
+            @Workflow.Generator.DisplayName
+        </span>
+        <span class="badge badge-neutral" title="Business clock used for classification">DemoClock @DemoClock.Now.ToString("yyyy-MM-dd HH:mm 'UTC'")</span>
+    </div>
+</header>
+
+<div class="layout">
+    <aside class="sidebar">
+        <section class="panel">
+            <h2>New case</h2>
+            <label for="scenario">Scenario</label>
+            <select id="scenario" @bind="selectedScenarioKey" @bind:after="ApplySelectedScenario">
+                @foreach (var s in DemoScenarios.All)
+                {
+                    <option value="@s.Key">@s.OrderId · @s.Title</option>
+                }
+                <option value="">Custom</option>
+            </select>
+            @if (SelectedScenario is { } sc)
+            {
+                <p class="hint">@sc.Description</p>
+            }
+
+            <label for="order">Order ID</label>
+            <input id="order" @bind="orderId" @bind:event="oninput" placeholder="TS-10025" maxlength="32" />
+
+            <label for="message">Customer message</label>
+            <textarea id="message" rows="4" @bind="customerMessage" @bind:event="oninput" maxlength="4000"></textarea>
+
+            <label for="reviewer">Reviewer label</label>
+            <input id="reviewer" @bind="reviewer" @bind:event="oninput" maxlength="64" />
+            <p class="hint">Demo label only — not an authenticated identity.</p>
+
+            <button class="btn btn-primary btn-block" disabled="@busy" @onclick="CreateCaseAsync">
+                @(busy ? "Working…" : "Create case & run MCP lookups")
+            </button>
+        </section>
+
+        @if (Mail.InboundEnabled && !Mail.InboundIsGmail)
+        {
+            <section class="panel inbox-panel">
+                <h2>Simulated Gmail inbox</h2>
+                <p class="hint">Sends a fake customer email to <code>@IngestOptions.SupportMailbox</code>. The ingest worker picks it up within @(Mail.PollSeconds)s and creates the case — no "Create case" click needed.</p>
+                <label for="preset">Sample email</label>
+                <select id="preset" @bind="selectedPresetKey" @bind:after="ApplySelectedPreset">
+                    @foreach (var p in EmailPresets.All)
+                    {
+                        <option value="@p.Key">@p.Title</option>
+                    }
+                </select>
+                @if (SelectedPreset is { } preset)
+                {
+                    <p class="hint">@preset.Description</p>
+                    <div class="mail-meta">
+                        <span><strong>From:</strong> @preset.FromName &lt;@preset.FromAddress&gt;</span>
+                        <span><strong>Auth:</strong> @AuthLabel(preset.Auth)</span>
+                        @if (preset.ThreadId is not null)
+                        {
+                            <span><strong>Thread:</strong> <code>@preset.ThreadId</code></span>
+                        }
+                    </div>
+                }
+                <label for="mail-subject">Subject</label>
+                <input id="mail-subject" @bind="mailSubject" @bind:event="oninput" maxlength="200" />
+                <label for="mail-body">Body</label>
+                <textarea id="mail-body" rows="4" @bind="mailBody" @bind:event="oninput" maxlength="8000"></textarea>
+                <button class="btn btn-block" disabled="@busy" @onclick="DeliverEmail">Deliver to support inbox</button>
+            </section>
+        }
+
+        @if (Mail.InboundEnabled)
+        {
+            <section class="panel">
+                <h2>Inbound email log</h2>
+                @if (inbound.Count == 0)
+                {
+                    <p class="muted">No email received yet.</p>
+                }
+                <ul class="inbound-list">
+                    @foreach (var m in inbound)
+                    {
+                        <li>
+                            <div class="inbound-top">
+                                <span class="inbound-from">@m.FromAddress</span>
+                                <span class="chip @OutcomeClass(m.Outcome)">@ShortOutcome(m.Outcome)</span>
+                            </div>
+                            <div class="inbound-subject">@m.Subject</div>
+                            @if (m.CaseId is { } cid)
+                            {
+                                <button class="link" @onclick="() => SelectAsync(cid)">Open case</button>
+                            }
+                        </li>
+                    }
+                </ul>
+            </section>
+        }
+
+        <section class="panel">
+            <h2>Cases</h2>
+            @if (cases.Count == 0)
+            {
+                <p class="muted">No cases yet. Pick a scenario and create one.</p>
+            }
+            <ul class="case-list">
+                @foreach (var c in cases)
+                {
+                    <li>
+                        <button class="case-item @(c.Id == selectedId ? "selected" : "")" @onclick="() => SelectAsync(c.Id)">
+                            <span class="case-order">@(c.Channel == CaseChannel.Email ? "✉ " : "")@c.OrderId</span>
+                            <span class="chip @StateClass(c.State)">@c.State</span>
+                            <span class="case-time">@Fmt(c.CreatedAtUtc)</span>
+                        </button>
+                    </li>
+                }
+            </ul>
+        </section>
+    </aside>
+
+    <main class="main">
+        @if (flash is not null)
+        {
+            <div class="flash flash-@flashKind" role="status">
+                <span>@flash</span>
+                @if (flashErrors is { Count: > 0 })
+                {
+                    <ul>@foreach (var e in flashErrors) { <li>@e</li> }</ul>
+                }
+            </div>
+        }
+
+        @if (details is null)
+        {
+            <section class="panel empty">
+                <h2>How this demo works</h2>
+                <ol>
+                    <li>Create a case. The backend calls lookup tools on a local <strong>MCP server</strong> over stdio.</li>
+                    <li>The evidence and every tool call are stored, then the case is classified using the DemoClock.</li>
+                    <li>A draft is generated from the evidence. Nothing is sent automatically.</li>
+                    <li>You review, edit, then <strong>Approve &amp; Simulate Send</strong> or <strong>Reject</strong>.</li>
+                    <li>Approved messages go to a simulated outbox. Every step lands in the audit timeline.</li>
+                </ol>
+            </section>
+        }
+        else
+        {
+            var c = details.Case;
+            var draft = details.CurrentDraft;
+
+            <section class="panel case-header">
+                <div class="case-title">
+                    <h2>@c.OrderId</h2>
+                    <span class="chip chip-lg @StateClass(c.State)">@c.State</span>
+                    @if (c.Classification != Classification.Unknown)
+                    {
+                        <span class="chip chip-outline">@c.Classification</span>
+                    }
+                </div>
+                @if (!string.IsNullOrEmpty(c.StateReason))
+                {
+                    <p class="reason @(c.State is CaseState.NeedsHuman or CaseState.LookupFailed ? "reason-alert" : "")">@c.StateReason</p>
+                }
+                @if (c.Channel == CaseChannel.Email)
+                {
+                    <div class="channel-line">
+                        <span class="chip chip-outline">✉ Email</span>
+                        <span>from <strong>@c.SenderEmail</strong></span>
+                        @if (c.SenderAuthenticated)
+                        {
+                            <span class="chip chip-sent" title="DMARC or aligned DKIM passed (stamped by @IngestOptions.TrustedAuthServId)">Sender authenticated</span>
+                        }
+                        else
+                        {
+                            <span class="chip chip-failed" title="No passing DMARC/aligned DKIM from @IngestOptions.TrustedAuthServId">Sender NOT authenticated</span>
+                        }
+                        @if (c.ChannelThreadId is not null)
+                        {
+                            <span class="muted small">thread <code>@c.ChannelThreadId</code></span>
+                        }
+                    </div>
+                    <div class="conversation">
+                        @foreach (var m in details.Conversation)
+                        {
+                            <article class="conv-msg @(m.Direction == MessageDirection.Inbound ? "conv-in" : "conv-out")">
+                                <div class="conv-head">
+                                    <span><strong>@(m.Direction == MessageDirection.Inbound ? m.FromAddress : $"Reply via {m.Provider}")</strong></span>
+                                    <span class="muted small">@Fmt(m.AtUtc)</span>
+                                </div>
+                                <div class="conv-subject">@m.Subject</div>
+                                @if (m.AuthenticationSummary is not null)
+                                {
+                                    <div class="muted small">@m.AuthenticationSummary</div>
+                                }
+                                <pre>@m.Body</pre>
+                                @if (m.Direction == MessageDirection.Inbound)
+                                {
+                                    <span class="label">Customer email (untrusted)</span>
+                                }
+                            </article>
+                        }
+                    </div>
+                }
+                else
+                {
+                    <blockquote class="customer-msg">
+                        <span class="label">Customer message (untrusted)</span>
+                        @(string.IsNullOrWhiteSpace(c.CustomerMessage) ? "(none)" : c.CustomerMessage)
+                    </blockquote>
+                }
+                <div class="actions">
+                    @if (c.State == CaseState.LookupFailed)
+                    {
+                        <button class="btn" disabled="@busy" @onclick="RetryAsync">Retry lookup</button>
+                    }
+                    @if (c.State == CaseState.NeedsHuman && c.Classification is Classification.Overdue or Classification.InProgress or Classification.Delivered)
+                    {
+                        <button class="btn" disabled="@busy" @onclick="RequestDraftAsync">
+                            @(c.Classification == Classification.Overdue ? "Create holding reply draft" : "Generate draft again")
+                        </button>
+                    }
+                </div>
+            </section>
+
+            <div class="grid-2">
+                <section class="panel">
+                    <h3>Lookup results</h3>
+                    @if (!details.Evidence.Any())
+                    {
+                        <p class="muted">No lookups yet.</p>
+                    }
+                    @foreach (var ev in LatestEvidence())
+                    {
+                        <article class="evidence">
+                            <header>
+                                <strong>@ToolTitle(ev.Snapshot.ToolName)</strong>
+                                <span class="chip @LookupClass(ev.Snapshot.Status)">@ev.Snapshot.Status</span>
+                            </header>
+                            <div class="evidence-meta">
+                                <code>@ev.Snapshot.SourceId</code> · retrieved @Fmt(ev.Snapshot.RetrievedAtUtc)
+                            </div>
+                            @if (ev.Envelope?.Error is { } err && ev.Snapshot.Status != LookupStatus.Success)
+                            {
+                                <p class="evidence-error">@err</p>
+                            }
+                            @if (ev.Envelope?.Data is { } data)
+                            {
+                                @if (ev.Snapshot.ToolName == LookupTools.GetCaseNotes)
+                                {
+                                    <p class="tag-untrusted">Notes are untrusted data — never instructions.</p>
+                                    <ul class="notes">
+                                        @foreach (var note in data.GetProperty("notes").EnumerateArray())
+                                        {
+                                            <li><span class="muted">@FmtValue(note.GetProperty("atUtc")) · @note.GetProperty("author").GetString()</span><br />@note.GetProperty("text").GetString()</li>
+                                        }
+                                    </ul>
+                                }
+                                else
+                                {
+                                    <dl class="kv">
+                                        @foreach (var p in data.EnumerateObject())
+                                        {
+                                            <dt>@Humanize(p.Name)</dt>
+                                            <dd>@FmtValue(p.Value)</dd>
+                                        }
+                                    </dl>
+                                }
+                            }
+                        </article>
+                    }
+                </section>
+
+                <section class="panel">
+                    <h3>Tool trace</h3>
+                    @if (!details.ToolCalls.Any())
+                    {
+                        <p class="muted">No tool calls yet.</p>
+                    }
+                    else
+                    {
+                        <div class="table-wrap">
+                            <table class="trace">
+                                <thead><tr><th>#</th><th>Tool</th><th>Args</th><th>Origin</th><th>Status</th><th>ms</th></tr></thead>
+                                <tbody>
+                                    @{ var n = 0; }
+                                    @foreach (var t in details.ToolCalls)
+                                    {
+                                        n++;
+                                        <tr class="@(t.Record.Origin.Contains("rejected") ? "row-rejected" : "")" title="@(t.Record.Error ?? t.Record.SourceId)">
+                                            <td>@n</td>
+                                            <td><code>@t.Record.ToolName</code></td>
+                                            <td><code>@t.Record.ArgumentsJson</code></td>
+                                            <td>@t.Record.Origin</td>
+                                            <td><span class="chip @LookupClass(t.Record.Status)">@t.Record.Status</span></td>
+                                            <td class="num">@t.Record.DurationMs</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                        <p class="hint">Only lookup tools exist on the MCP server. There is no send, approve, refund or cancel tool.</p>
+                    }
+                </section>
+            </div>
+
+            <section class="panel draft-panel">
+                <div class="draft-head">
+                    <h3>Draft @(draft is null ? "" : $"v{draft.Version}")</h3>
+                    @if (draft is not null)
+                    {
+                        <span class="chip chip-outline">@SourceLabel(draft)</span>
+                        @if (draft.Kind == DraftKind.Holding)
+                        {
+                            <span class="chip chip-outline">Holding reply</span>
+                        }
+                    }
+                </div>
+
+                @if (draft is null)
+                {
+                    <p class="muted">No draft. @(c.State is CaseState.NeedsHuman ? "This case needs a staff member." : "")</p>
+                }
+                else
+                {
+                    var editable = c.State == CaseState.AwaitingReview && !busy;
+
+                    @foreach (var w in draft.Warnings)
+                    {
+                        <div class="warning">⚠ @w</div>
+                    }
+
+                    <label>To</label>
+                    <input value="@draft.Recipient" readonly title="Taken from the order record; cannot be edited." />
+                    <p class="hint">Recipient comes from the order record, not from the customer's message or the draft generator.</p>
+
+                    <label for="subject">Subject</label>
+                    <input id="subject" @bind="editSubject" @bind:event="oninput" disabled="@(!editable)" maxlength="200" />
+
+                    <label for="body">Body</label>
+                    <textarea id="body" rows="12" @bind="editBody" @bind:event="oninput" disabled="@(!editable)" maxlength="4000"></textarea>
+
+                    <div class="refs">
+                        <span class="muted">Evidence:</span>
+                        @foreach (var r in draft.EvidenceRefs)
+                        {
+                            <code class="ref">@r</code>
+                        }
+                    </div>
+
+                    @if (c.State == CaseState.AwaitingReview)
+                    {
+                        <div class="review-bar">
+                            <button class="btn" disabled="@(!editable || !Dirty)" @onclick="SaveEditAsync">Save as v@(draft.Version + 1)</button>
+                            <button class="btn btn-approve" disabled="@(!editable || Dirty)" @onclick="ApproveAsync"
+                                    title="@(Dirty ? "Save your edits first — approval applies to a saved version." : $"Approve v{draft.Version}")">
+                                @(Sender.IsSimulated ? "Approve & Simulate Send" : "Approve & Send via Gmail")
+                            </button>
+                            <input class="reject-reason" placeholder="Reject reason (optional)" @bind="rejectReason" disabled="@(!editable)" maxlength="200" />
+                            <button class="btn btn-reject" disabled="@(!editable)" @onclick="RejectAsync">Reject</button>
+                        </div>
+                        @if (Dirty)
+                        {
+                            <p class="hint">You have unsaved edits. Save them as a new version before approving.</p>
+                        }
+                    }
+                    else
+                    {
+                        <p class="hint">Review actions are only available while the case is AwaitingReview.</p>
+                    }
+
+                    @if (details.Drafts.Count > 1)
+                    {
+                        <details class="history">
+                            <summary>Draft history (@details.Drafts.Count versions)</summary>
+                            <ul>
+                                @foreach (var d in details.Drafts.OrderByDescending(d => d.Version))
+                                {
+                                    <li>v@d.Version · @SourceLabel(d) · @d.CreatedBy · @Fmt(d.CreatedAtUtc)</li>
+                                }
+                            </ul>
+                        </details>
+                    }
+                }
+            </section>
+
+            <div class="grid-2">
+                <section class="panel">
+                    <h3>Audit timeline</h3>
+                    <ol class="timeline">
+                        @foreach (var a in details.Audit)
+                        {
+                            <li>
+                                <span class="tl-time">@Fmt(a.AtUtc)</span>
+                                <span class="tl-type">@a.EventType</span>
+                                <span class="tl-actor">@a.Actor</span>
+                                <span class="tl-detail">@a.Detail</span>
+                            </li>
+                        }
+                    </ol>
+                </section>
+
+                <section class="panel">
+                    <h3>@(Sender.IsSimulated ? "Simulated outbox" : $"Sent via {Sender.Name}")</h3>
+                    @if (!Sender.IsSimulated)
+                    {
+                        @foreach (var o in details.Outbox)
+                        {
+                            <article class="mail">
+                                <div class="mail-head"><span><strong>To:</strong> @o.Recipient</span><span class="chip @(o.Status == OutboxStatuses.Sent ? "chip-sent" : "chip-human")">@o.Status</span></div>
+                                <div><strong>Subject:</strong> @o.Subject</div>
+                                <pre>@o.Body</pre>
+                            </article>
+                        }
+                    }
+                    @if (Sender.IsSimulated && mailbox.Count == 0)
+                    {
+                        <p class="muted">Nothing sent. Messages appear here only after approval.</p>
+                    }
+                    @foreach (var m in mailbox)
+                    {
+                        <article class="mail">
+                            <div class="mail-head">
+                                <span><strong>To:</strong> @m.Recipient</span>
+                                <span class="muted">@Fmt(m.WrittenAtUtc)</span>
+                            </div>
+                            <div><strong>Subject:</strong> @m.Subject</div>
+                            <pre>@m.Body</pre>
+                            @if (m.ThreadId is not null)
+                            {
+                                <div class="muted small">Gmail thread <code>@m.ThreadId</code> · In-Reply-To <code>@(m.InReplyTo ?? "—")</code></div>
+                            }
+                            <div class="muted small">Idempotency key <code>@m.IdempotencyKey</code> · simulated, no real email sent</div>
+                        </article>
+                    }
+                </section>
+            </div>
+        }
+    </main>
+</div>
+
+@code {
+    private string selectedScenarioKey = DemoScenarios.All[0].Key;
+    private string orderId = string.Empty;
+    private string customerMessage = string.Empty;
+    private string reviewer = "demo-reviewer";
+    private string rejectReason = string.Empty;
+
+    private bool busy;
+    private string? flash;
+    private string flashKind = "info";
+    private IReadOnlyList<string>? flashErrors;
+
+    private IReadOnlyList<SupportCase> cases = [];
+    private Guid? selectedId;
+    private CaseDetails? details;
+    private IReadOnlyList<SimulatedMessage> mailbox = [];
+
+    private string editSubject = string.Empty;
+    private string editBody = string.Empty;
+    private int loadedVersion;
+
+    private string selectedPresetKey = EmailPresets.All[0].Key;
+    private string mailSubject = string.Empty;
+    private string mailBody = string.Empty;
+    private IReadOnlyList<InboundRecord> inbound = [];
+
+    private EmailPreset? SelectedPreset => EmailPresets.All.FirstOrDefault(p => p.Key == selectedPresetKey);
+
+    private void ApplySelectedPreset()
+    {
+        if (SelectedPreset is { } p)
+        {
+            mailSubject = p.Subject;
+            mailBody = p.Body;
+        }
+    }
+
+    private void DeliverEmail()
+    {
+        if (SelectedPreset is not { } p) return;
+        SimulatedInbox.Deliver(SimulatedEmailFactory.Create(p.FromAddress, p.FromName, mailSubject, mailBody, p.Auth, IngestOptions.SupportMailbox,
+            threadId: p.ThreadId, autoSubmitted: p.AutoSubmitted));
+        Flash($"Email from {p.FromAddress} delivered to the simulated inbox. Waiting for the ingest worker…", "info");
+    }
+
+    private static string AuthLabel(SimulatedAuth a) => a switch
+    {
+        SimulatedAuth.Pass => "DKIM/SPF/DMARC pass",
+        SimulatedAuth.Fail => "DMARC fail (spoofed)",
+        _ => "forged header only",
+    };
+
+    private static string ShortOutcome(string outcome) => outcome.StartsWith("Ignored", StringComparison.Ordinal) ? "Ignored" : outcome;
+
+    private static string OutcomeClass(string outcome) => outcome switch
+    {
+        IngestOutcomes.CaseCreated or IngestOutcomes.AppendedToCase => "chip-review",
+        IngestOutcomes.Failed => "chip-failed",
+        _ => "chip-neutral",
+    };
+
+    private DemoScenario? SelectedScenario => DemoScenarios.All.FirstOrDefault(s => s.Key == selectedScenarioKey);
+
+    private bool Dirty => details?.CurrentDraft is { } d && (editSubject != d.Subject || editBody != d.Body);
+
+    protected override async Task OnInitializedAsync()
+    {
+        ApplySelectedScenario();
+        ApplySelectedPreset();
+        Notifier.Changed += OnChanged;
+        await RefreshAsync();
+    }
+
+    private void ApplySelectedScenario()
+    {
+        if (SelectedScenario is { } s)
+        {
+            orderId = s.OrderId;
+            customerMessage = s.CustomerMessage;
+        }
+    }
+
+    private void OnChanged(Guid? caseId) => _ = InvokeAsync(async () =>
+    {
+        if (busy) return;
+        await RefreshAsync();
+        StateHasChanged();
+    });
+
+    private async Task RefreshAsync()
+    {
+        cases = await Repository.ListCasesAsync(30);
+        inbound = Mail.InboundEnabled ? await MailStore.ListInboundAsync(8) : [];
+        if (selectedId is not { } id) return;
+
+        details = await Repository.GetDetailsAsync(id);
+        mailbox = await Repository.ListSimulatedMessagesAsync(id);
+        var d = details?.CurrentDraft;
+        if (d is null)
+        {
+            loadedVersion = 0;
+            editSubject = editBody = string.Empty;
+        }
+        else if (d.Version != loadedVersion)
+        {
+            // New version (from another tab or after saving): reload the displayed content.
+            loadedVersion = d.Version;
+            editSubject = d.Subject;
+            editBody = d.Body;
+        }
+    }
+
+    private async Task SelectAsync(Guid id)
+    {
+        selectedId = id;
+        loadedVersion = 0;
+        flash = null;
+        await RefreshAsync();
+    }
+
+    private async Task RunAsync(Func<Task> action)
+    {
+        if (busy) return;
+        busy = true;
+        flash = null;
+        flashErrors = null;
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            Flash($"Unexpected error: {ex.Message}", "error");
+        }
+        finally
+        {
+            busy = false;
+            await RefreshAsync();
+            Notifier.Notify(selectedId);
+        }
+    }
+
+    private Task CreateCaseAsync() => RunAsync(async () =>
+    {
+        var (id, result) = await Workflow.CreateCaseAsync(new NewCaseRequest(orderId, customerMessage, reviewer));
+        if (id is { } caseId)
+        {
+            selectedId = caseId;
+            loadedVersion = 0;
+        }
+
+        Flash(result.Message, result.Succeeded ? "success" : "warn", result.Errors);
+    });
+
+    private Task RetryAsync() => RunAsync(async () =>
+    {
+        var result = await Workflow.RetryLookupAsync(selectedId!.Value, reviewer);
+        Flash(result.Message, result.Succeeded ? "success" : "warn", result.Errors);
+    });
+
+    private Task RequestDraftAsync() => RunAsync(async () =>
+    {
+        var result = await Workflow.RequestDraftAsync(selectedId!.Value, reviewer);
+        Flash(result.Message, result.Succeeded ? "success" : "warn", result.Errors);
+    });
+
+    private Task SaveEditAsync() => RunAsync(async () =>
+    {
+        var result = await Workflow.EditDraftAsync(selectedId!.Value, loadedVersion, editSubject, editBody, reviewer);
+        Flash(result.Message, result.Succeeded ? "success" : "error", result.Errors);
+    });
+
+    private Task ApproveAsync() => RunAsync(async () =>
+    {
+        // Approve exactly the displayed version; if another tab changed it, the backend returns a conflict.
+        var result = await Workflow.ApproveAsync(selectedId!.Value, loadedVersion, reviewer);
+        Flash(result.Message, result.Outcome == ApprovalOutcome.Approved ? "success" : "error");
+    });
+
+    private Task RejectAsync() => RunAsync(async () =>
+    {
+        var result = await Workflow.RejectAsync(selectedId!.Value, loadedVersion, reviewer, string.IsNullOrWhiteSpace(rejectReason) ? null : rejectReason);
+        Flash(result.Message, result.Outcome == ApprovalOutcome.Rejected ? "success" : "error");
+        rejectReason = string.Empty;
+    });
+
+    private void Flash(string message, string kind, IReadOnlyList<string>? errors = null)
+    {
+        flash = message;
+        flashKind = kind;
+        flashErrors = errors;
+    }
+
+    private sealed record EvidenceView(EvidenceSnapshot Snapshot, LookupEnvelope? Envelope);
+
+    private IEnumerable<EvidenceView> LatestEvidence()
+    {
+        string[] order = [LookupTools.GetOrder, LookupTools.GetDeliveryStatus, LookupTools.GetCaseNotes, LookupTools.GetDemoPolicy];
+        return details!.Evidence
+            .GroupBy(e => e.ToolName)
+            .Select(g => g.OrderBy(e => e.RetrievedAtUtc).Last())
+            .OrderBy(e => Array.IndexOf(order, e.ToolName))
+            .Select(e => new EvidenceView(e, LookupTools.TryParse(e.PayloadJson)));
+    }
+
+    private static string ToolTitle(string tool) => tool switch
+    {
+        LookupTools.GetOrder => "Order",
+        LookupTools.GetDeliveryStatus => "Delivery",
+        LookupTools.GetCaseNotes => "Case notes",
+        LookupTools.GetDemoPolicy => "Demo policy (fictional)",
+        _ => tool,
+    };
+
+    private static string SourceLabel(Draft d) => d.Source switch
+    {
+        DraftSource.Template => "Template demo — no LLM",
+        DraftSource.LiveAi => "Live AI draft",
+        DraftSource.StaffEdit => $"Edited by {d.CreatedBy}",
+        _ => d.Source.ToString(),
+    };
+
+    private static string StateClass(CaseState s) => s switch
+    {
+        CaseState.AwaitingReview => "chip-review",
+        CaseState.NeedsHuman => "chip-human",
+        CaseState.LookupFailed => "chip-failed",
+        CaseState.Approved => "chip-approved",
+        CaseState.SimulatedSent or CaseState.Sent => "chip-sent",
+        CaseState.Rejected => "chip-rejected",
+        _ => "chip-neutral",
+    };
+
+    private static string LookupClass(LookupStatus s) => s switch
+    {
+        LookupStatus.Success => "chip-sent",
+        LookupStatus.NotFound => "chip-human",
+        _ => "chip-failed",
+    };
+
+    private static string Humanize(string name) =>
+        string.Concat(name.Select((ch, i) => i > 0 && char.IsUpper(ch) ? " " + char.ToLowerInvariant(ch) : (i == 0 ? char.ToUpperInvariant(ch).ToString() : ch.ToString())))
+            .Replace(" utc", "");
+
+    private static string FmtValue(JsonElement v) => v.ValueKind switch
+    {
+        JsonValueKind.String when DateTimeOffset.TryParse(v.GetString(), System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var t)
+            && v.GetString()!.Contains('T') => Fmt(t),
+        JsonValueKind.String => v.GetString() ?? string.Empty,
+        JsonValueKind.True => "yes",
+        JsonValueKind.False => "no",
+        JsonValueKind.Null => "—",
+        _ => v.ToString(),
+    };
+
+    private static string Fmt(DateTimeOffset t) => t.ToUniversalTime().ToString("MMM d, HH:mm:ss 'UTC'", System.Globalization.CultureInfo.InvariantCulture);
+
+    public void Dispose() => Notifier.Changed -= OnChanged;
+}
