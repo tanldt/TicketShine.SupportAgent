@@ -39,7 +39,7 @@ Before real use, the minimum required is: SSO/staff login, role authorization fo
 
 | Item | Status |
 |---|---|
-| `dotnet restore`, `dotnet build`, `dotnet test` (63 tests) | Run, passing |
+| `dotnet restore`, `dotnet build`, `dotnet test` (64 tests) | Run, passing |
 | Email ingest: sender authentication, threading, de-duplication, auto-replies | Tested |
 | Simulated Gmail inbox flow in the UI | Click-tested automatically with headless Chrome |
 | Gmail adapter against a real mailbox | **Not run** (fake Gmail API only) |

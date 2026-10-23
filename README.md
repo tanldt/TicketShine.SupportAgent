@@ -68,7 +68,7 @@ TicketShine.SupportAgent.sln
 ├─ src/TicketShine.Support.McpServer       MCP stdio server — lookup tools only
 ├─ src/TicketShine.Support.Gmail           Gmail adapter: inbound (history API) and reply sender (not yet run against a real mailbox)
 ├─ src/TicketShine.Support.Web             ASP.NET Core + Blazor Interactive Server (workspace review)
-├─ tests/TicketShine.Support.Tests         63 tests: real MCP stdio, classification, review gate, concurrency, restart,
+├─ tests/TicketShine.Support.Tests         64 tests: real MCP stdio, classification, review gate, concurrency, restart,
 │                                          Live AI (fake transport), email ingest, sender authentication, Gmail adapter (fake HTTP)
 ├─ data/demo-seed.json                     all fake data
 ├─ docs/                                   architecture, demo script, limitations

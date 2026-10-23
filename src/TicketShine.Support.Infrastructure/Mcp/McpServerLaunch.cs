@@ -44,6 +44,7 @@ public static class McpServerLocator
 
         string command;
         List<string> args;
+        var workingDirectory = root;
         if (options.Command is { Length: > 0 })
         {
             command = options.Command;
@@ -52,8 +53,13 @@ public static class McpServerLocator
         else
         {
             if (root is null) throw new InvalidOperationException($"Could not find {SolutionFile}; set Mcp:Command explicitly.");
+            // On Windows the MCP SDK starts the server through `cmd.exe /c`, which drops the outer quotes when the line has
+            // more than one quoted path (e.g. dotnet under "Program Files" plus a repo under "C:\Users\First Last").
+            // Run the DLL by file name from its own folder; the seed path goes through TS_SEED_PATH below.
+            var dll = FindServerDll(root);
             command = DotnetHostPath();
-            args = [FindServerDll(root), "--seed", seed];
+            args = [Path.GetFileName(dll)];
+            workingDirectory = Path.GetDirectoryName(dll);
         }
 
         var env = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -67,7 +73,7 @@ public static class McpServerLocator
         env["DOTNET_NOLOGO"] = "1";
         env["TS_SEED_PATH"] = seed;
 
-        return new McpServerLaunch(command, args, root, env, TimeSpan.FromSeconds(Math.Max(1, options.ToolTimeoutSeconds)));
+        return new McpServerLaunch(command, args, workingDirectory, env, TimeSpan.FromSeconds(Math.Max(1, options.ToolTimeoutSeconds)));
     }
 
     public static string? FindSolutionRoot(string start)

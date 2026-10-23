@@ -85,6 +85,17 @@ public sealed class McpStdioTests(McpFixture mcp)
     }
 
     [Fact]
+    public void Default_launch_passes_no_paths_as_arguments()
+    {
+        // cmd.exe /c breaks when both the command and an argument are quoted paths.
+        var launch = McpServerLocator.Resolve(new McpServerOptions());
+
+        Assert.Equal(["TicketShine.Support.McpServer.dll"], launch.Arguments);
+        Assert.True(File.Exists(Path.Combine(launch.WorkingDirectory!, launch.Arguments[0])));
+        Assert.True(File.Exists(launch.Environment["TS_SEED_PATH"]));
+    }
+
+    [Fact]
     public void Child_process_environment_does_not_include_secrets()
     {
         Environment.SetEnvironmentVariable("ANTHROPIC_API_KEY", "should-not-leak");
